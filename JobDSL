@@ -1,0 +1,123 @@
+import groovy.json.JsonOutput
+
+def clusterMap = [:]
+def allDbClusters = ALL_CLUSTERS.findAll { it.contains("-db") }
+
+ENVIRONMENTS.each { env ->
+    def filtered = []
+
+    if (JENKINS_INSTANCE == "dev-instance") {
+        if (env == "pre-production") {
+            filtered = allDbClusters.findAll { it.contains("preprod") }
+        } else {
+            filtered = allDbClusters.findAll { !it.contains("preprod") }
+        }
+    } else {
+        def region = env.replaceFirst("production-", "").replaceAll("-", "").toLowerCase()
+
+        allDbClusters.each { cluster ->
+            def normalizedCluster = cluster.replaceAll("-", "").toLowerCase()
+            if ((region == "specialregion" && normalizedCluster.contains("region2")) ||
+                (region != "specialregion" && normalizedCluster.contains(region))) {
+                filtered << cluster
+            }
+        }
+    }
+
+    clusterMap[env] = filtered.unique().sort()
+}
+
+def clusterMapJson = JsonOutput.toJson(clusterMap).replace("'", "\\'")
+
+pipelineJob("Delete-Disabled-Formations") {
+    displayName("Delete-Disabled-Formations")
+    description("Deletes disabled formations. Supports dry run mode.")
+
+    logRotator {
+        daysToKeep(30)
+        numToKeep(100)
+    }
+
+    properties {
+        disableConcurrentBuilds()
+    }
+
+    parameters {
+	// TARGET_ENV parameter
+        if (JENKINS_INSTANCE == "dev-instance") {
+            choice {
+                name("TARGET_ENV")
+                description("Select a target environment.")
+                choices("dev\npre-production")
+            }
+        } else {
+            choice {
+                name("TARGET_ENV")
+                description("Select a target environment.")
+                choices(ENVIRONMENTS.join("\n"))
+            }
+        }
+
+	// CLUSTER_MODE parameter
+        choiceParam("CLUSTER_MODE", ["All", "Specific"], "Choose whether to target all clusters or a specific cluster.")
+
+	// CLUSTER parameter (reactive only if CLUSTER_MODE == Specific)
+        activeChoiceReactiveParam("CLUSTER") {
+            description("Select clusters to target. Ignored if CLUSTER_MODE is 'All'.")
+            choiceType("CHECKBOX")
+            groovyScript {
+                script("""
+                    import groovy.json.JsonSlurper
+                    def clusterMap = new JsonSlurper().parseText('${clusterMapJson}')
+                    if (!TARGET_ENV || !CLUSTER_MODE) {
+                        return ['Please select TARGET_ENV and CLUSTER_MODE']
+                    }
+                    
+                    if (CLUSTER_MODE == "Specific") {
+                        def clusters = TARGET_ENV == "dev"
+                            ? clusterMap.values()[0]
+                            : clusterMap[TARGET_ENV] ?: []
+                        return clusters.sort()
+                    }
+                    else {
+                        return []
+                    }
+                """)
+                fallbackScript("return ['No clusters available']")
+            }
+            referencedParameter("TARGET_ENV")
+            referencedParameter("CLUSTER_MODE")
+        }
+
+        choiceParam("DATABASE_TYPE",
+            ["mysql", "redis", "postgresql", "rabbitmq", "etcd", "elasticsearch",
+             "mongodb", "enterprisedb"],
+            "Select a database type."
+        )
+
+        stringParam("DATABASE_VERSION", "", "Enter the database version.")
+
+        choiceParam("FORMATION_MODE", ["All", "Specific"], "Target all formations or a specific one.")
+
+        stringParam("FORMATION", "", "Enter Formation ID if FORMATION_MODE is 'Specific'.")
+
+        booleanParam("DELETE_CONFIRMATION", false,
+            """<b>⚠️ CAUTION: This job runs in DRY RUN mode by default.</b><br><br>
+            <span style='color:red; font-weight:bold;'>Check this box ONLY if:</span><br>
+            • You have reviewed the dry run output.<br>
+            • A peer has validated and approved the deletion scope.<br><br>
+            <b style='color:red;'>This action is IRREVERSIBLE and will DELETE formations permanently.</b>"""
+        )
+    }
+
+    definition {
+        cps {
+            script("""
+                def JENKINS_INSTANCE = '${JENKINS_INSTANCE}'
+                def CLUSTER_MAP_JSON = '''${groovy.json.JsonOutput.prettyPrint(groovy.json.JsonOutput.toJson(clusterMap))}'''
+                ${readFileFromWorkspace('jobs/Delete-Disabled-Formations/Jenkinsfile')}
+            """)
+            sandbox(true)
+        }
+    }
+}
